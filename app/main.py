@@ -250,59 +250,6 @@ def health_check():
 
 
 
-
-@app.get("/test-db")
-
-def test_database():
-
-    from sqlalchemy import text
-
-
-
-    with source_engine.connect() as connection:
-
-        result = connection.execute(text("SELECT 1"))
-
-        source_result = result.scalar()
-
-
-
-    with destination_engine.connect() as connection:
-
-        result = connection.execute(text("SELECT 1"))
-
-        destination_result = result.scalar()
-
-
-
-    return {
-
-        "source_database": source_result,
-
-        "destination_database": destination_result,
-
-    }
-
-
-
-
-
-@app.get("/schema")
-
-def get_schema():
-
-    return {
-
-        "source": get_database_schema(source_engine),
-
-        "destination": get_database_schema(destination_engine),
-
-    }
-
-
-
-
-
 @app.get(
 
     "/connections/{connection_id}/mapping-suggestions"
@@ -1456,96 +1403,12 @@ def get_connection_schema(
 
 
 
-@app.post("/connections/{connection_id}/sync")
 
+@app.post("/connections/{connection_id}/sync")
 def sync_connection(
     connection_id: int,
     current_user: User = Depends(get_current_user),
 ):
-
-
-    with Session(datasync_engine) as session:
-        connection = get_owned_connection(
-            session,
-            connection_id,
-            current_user.id,
-        )
-
-        if not connection:
-            raise HTTPException(
-                status_code=404,
-                detail="Connection not found.",
-            )
-
-    try:
-
-        result = run_sync(
-
-            datasync_engine=datasync_engine,
-
-            source_engine=source_engine,
-
-            destination_engine=destination_engine,
-
-            connection_id=connection_id,
-
-        )
-
-
-
-        return result
-
-
-
-    except ValueError as error:
-
-        raise HTTPException(
-
-            status_code=400,
-
-            detail=str(error),
-
-        )
-
-
-
-    except Exception as error:
-
-        raise HTTPException(
-
-            status_code=500,
-
-            detail=str(error),
-
-        )
-
-
-
-
-
-@app.post("/connections/{connection_id}/sync-runs/{sync_run_id}/retry")
-
-def retry_sync(
-    connection_id: int,
-    sync_run_id: int,
-    current_user: User = Depends(get_current_user),
-):
-
-    with Session(datasync_engine) as session:
-        connection = get_owned_connection(
-            session,
-            connection_id,
-            current_user.id,
-        )
-
-        if not connection:
-            raise HTTPException(
-                status_code=404,
-                detail="Connection not found.",
-            )
-
-    # Verify that this sync run belongs to this connection
-
     with Session(datasync_engine) as session:
         get_owned_connection(
             session,
@@ -1553,109 +1416,124 @@ def retry_sync(
             current_user.id,
         )
 
-
-        sync_run = (
-
-            session.query(SyncRun)
-
-            .filter(
-
-                SyncRun.id == sync_run_id,
-
-                SyncRun.connection_id == connection_id,
-
-            )
-
-            .first()
-
-        )
-
-
-
-        if not sync_run:
-
-            raise HTTPException(
-
-                status_code=404,
-
-                detail="Sync run not found for this connection",
-
-            )
-
-
-
-        if sync_run.status not in {
-
-            SYNC_FAILED,
-
-            SYNC_COMPLETED_WITH_ERRORS,
-
-        }:
-
-            raise HTTPException(
-
-                status_code=400,
-
-                detail=(
-
-                    "Only failed or completed_with_errors "
-
-                    "sync runs can be retried"
-
-                ),
-
-            )
-
-
+    source_engine_for_connection = None
+    destination_engine_for_connection = None
 
     try:
+        (
+            source_engine_for_connection,
+            destination_engine_for_connection,
+        ) = get_connection_engines(connection_id)
 
         result = run_sync(
-
             datasync_engine=datasync_engine,
-
-            source_engine=source_engine,
-
-            destination_engine=destination_engine,
-
+            source_engine=source_engine_for_connection,
+            destination_engine=destination_engine_for_connection,
             connection_id=connection_id,
-
         )
 
-
-
-        return {
-
-            "retry_of_sync_run_id": sync_run_id,
-
-            **result,
-
-        }
-
-
+        return result
 
     except ValueError as error:
-
         raise HTTPException(
-
             status_code=400,
-
             detail=str(error),
-
         )
 
-
-
-    except Exception as error:
-
+    except Exception:
         raise HTTPException(
-
             status_code=500,
-
-            detail=str(error),
-
+            detail="Synchronization failed. Check the sync run history for details.",
         )
 
+    finally:
+        if source_engine_for_connection is not None:
+            source_engine_for_connection.dispose()
+
+        if destination_engine_for_connection is not None:
+            destination_engine_for_connection.dispose()
+
+
+
+
+
+
+@app.post("/connections/{connection_id}/sync-runs/{sync_run_id}/retry")
+def retry_sync(
+    connection_id: int,
+    sync_run_id: int,
+    current_user: User = Depends(get_current_user),
+):
+    with Session(datasync_engine) as session:
+        get_owned_connection(
+            session,
+            connection_id,
+            current_user.id,
+        )
+
+        sync_run = (
+            session.query(SyncRun)
+            .filter(
+                SyncRun.id == sync_run_id,
+                SyncRun.connection_id == connection_id,
+            )
+            .first()
+        )
+
+        if not sync_run:
+            raise HTTPException(
+                status_code=404,
+                detail="Sync run not found for this connection.",
+            )
+
+        if sync_run.status not in {
+            SYNC_FAILED,
+            SYNC_COMPLETED_WITH_ERRORS,
+        }:
+            raise HTTPException(
+                status_code=400,
+                detail="Only failed or completed_with_errors sync runs can be retried.",
+            )
+
+    source_engine_for_connection = None
+    destination_engine_for_connection = None
+
+    try:
+        (
+            source_engine_for_connection,
+            destination_engine_for_connection,
+        ) = get_connection_engines(connection_id)
+
+        result = run_sync(
+            datasync_engine=datasync_engine,
+            source_engine=source_engine_for_connection,
+            destination_engine=destination_engine_for_connection,
+            connection_id=connection_id,
+        )
+
+        return {
+            "retry_of_sync_run_id": sync_run_id,
+            **result,
+        }
+
+    except ValueError as error:
+        raise HTTPException(
+            status_code=400,
+            detail=str(error),
+        )
+
+    except Exception:
+        raise HTTPException(
+            status_code=500,
+            detail="Retry failed. Check the new sync run history for details.",
+        )
+
+    finally:
+        if source_engine_for_connection is not None:
+            source_engine_for_connection.dispose()
+
+        if destination_engine_for_connection is not None:
+            destination_engine_for_connection.dispose()
 
 
 

@@ -54,8 +54,18 @@ def sync_table(
     # Find the destination key used for UPSERT.
     key_column = find_sync_key(
         destination_columns,
-        mappings,
+        mappings
     )
+
+    
+    if key_column is None:
+        raise ValueError(
+            "Cannot safely synchronize this table: "
+            "no mapped primary key or unique column was found "
+            "in the destination. Map a reliable unique key "
+            "before running the sync."
+        )
+
 
     # Read either all records or only changed records.
     records = read_records(
