@@ -1,5 +1,5 @@
 
-name: Build and Publish DataSync
+name: DataSync CI/CD
 
 on:
   push:
@@ -11,11 +11,34 @@ permissions:
   contents: read
   packages: write
 
-env:
-  REGISTRY: ghcr.io
-
 jobs:
+  quality-checks:
+    name: Lint and Test
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Check Python code
+        run: ruff check app --select E4,E7,E9
+
+      - name: Run automated tests
+        run: python -m pytest -v
+
   build:
+    name: Build and Publish Docker Image
+    needs: quality-checks
     runs-on: ubuntu-latest
 
     steps:
@@ -33,7 +56,7 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and publish image
+      - name: Build and publish Docker image
         uses: docker/build-push-action@v6
         with:
           context: .
