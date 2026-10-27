@@ -1,4 +1,11 @@
 from datetime import datetime, timezone
+from arq.jobs import Job, JobStatus
+
+import os
+import uuid
+
+from arq import create_pool
+from arq.connections import RedisSettings
 
 
 
@@ -1404,11 +1411,13 @@ def get_connection_schema(
 
 
 
+
 @app.post("/connections/{connection_id}/sync")
-def sync_connection(
+async def sync_connection(
     connection_id: int,
     current_user: User = Depends(get_current_user),
 ):
+    # Check that this connection belongs to the logged-in user.
     with Session(datasync_engine) as session:
         get_owned_connection(
             session,
@@ -1416,54 +1425,99 @@ def sync_connection(
             current_user.id,
         )
 
-    source_engine_for_connection = None
-    destination_engine_for_connection = None
+    redis = None
+    lock_key = f"datasync:sync-lock:{connection_id}"
+    lock_token = uuid.uuid4().hex
 
     try:
-        (
-            source_engine_for_connection,
-            destination_engine_for_connection,
-        ) = get_connection_engines(connection_id)
-
-        result = run_sync(
-            datasync_engine=datasync_engine,
-            source_engine=source_engine_for_connection,
-            destination_engine=destination_engine_for_connection,
-            connection_id=connection_id,
+        redis = await create_pool(
+            RedisSettings.from_dsn(
+                os.getenv(
+                    "REDIS_URL",
+                    "redis://localhost:6379/0",
+                )
+            )
         )
 
-        return result
-
-    except ValueError as error:
-        raise HTTPException(
-            status_code=400,
-            detail=str(error),
+        # Acquire the lock only if no sync already owns it.
+        acquired = await redis.set(
+            lock_key,
+            lock_token,
+            nx=True,
+            ex=7200,
         )
+
+        if not acquired:
+            raise HTTPException(
+                status_code=409,
+                detail="A synchronization job is already queued or running for this connection.",
+            )
+
+        try:
+            job = await redis.enqueue_job(
+                "sync_connection_job",
+                connection_id,
+                current_user.id,
+                lock_token,
+                _job_id=f"sync-{uuid.uuid4().hex}",
+            )
+
+            if job is None:
+                raise RuntimeError(
+                    "ARQ did not enqueue the synchronization job."
+                )
+
+        except Exception:
+            # Release only our own lock if enqueueing fails.
+            await redis.eval(
+                """
+                if redis.call("GET", KEYS[1]) == ARGV[1] then
+                    return redis.call("DEL", KEYS[1])
+                end
+                return 0
+                """,
+                1,
+                lock_key,
+                lock_token,
+            )
+            raise
+
+        return {
+            "status": "queued",
+            "connection_id": connection_id,
+            "job_id": job.job_id,
+            "message": "Synchronization job queued successfully.",
+        }
+
+    except HTTPException:
+        raise
 
     except Exception:
         raise HTTPException(
-            status_code=500,
-            detail="Synchronization failed. Check the sync run history for details.",
+            status_code=503,
+            detail="Unable to queue synchronization. Check that Redis is running.",
         )
 
     finally:
-        if source_engine_for_connection is not None:
-            source_engine_for_connection.dispose()
-
-        if destination_engine_for_connection is not None:
-            destination_engine_for_connection.dispose()
+        if redis is not None:
+            await redis.aclose()
 
 
 
 
 
 
-@app.post("/connections/{connection_id}/sync-runs/{sync_run_id}/retry")
-def retry_sync(
+
+
+@app.post(
+    "/connections/{connection_id}/sync-runs/{sync_run_id}/retry"
+)
+async def retry_sync(
     connection_id: int,
     sync_run_id: int,
     current_user: User = Depends(get_current_user),
 ):
+    # Verify ownership and ensure this run can be retried.
     with Session(datasync_engine) as session:
         get_owned_connection(
             session,
@@ -1492,48 +1546,94 @@ def retry_sync(
         }:
             raise HTTPException(
                 status_code=400,
-                detail="Only failed or completed_with_errors sync runs can be retried.",
+                detail=(
+                    "Only failed or completed_with_errors "
+                    "sync runs can be retried."
+                ),
             )
 
-    source_engine_for_connection = None
-    destination_engine_for_connection = None
+    redis = None
+    lock_key = f"datasync:sync-lock:{connection_id}"
+    lock_token = uuid.uuid4().hex
 
     try:
-        (
-            source_engine_for_connection,
-            destination_engine_for_connection,
-        ) = get_connection_engines(connection_id)
-
-        result = run_sync(
-            datasync_engine=datasync_engine,
-            source_engine=source_engine_for_connection,
-            destination_engine=destination_engine_for_connection,
-            connection_id=connection_id,
+        redis = await create_pool(
+            RedisSettings.from_dsn(
+                os.getenv(
+                    "REDIS_URL",
+                    "redis://localhost:6379/0",
+                )
+            )
         )
+
+        acquired = await redis.set(
+            lock_key,
+            lock_token,
+            nx=True,
+            ex=7200,
+        )
+
+        if not acquired:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "A synchronization job is already "
+                    "queued or running for this connection."
+                ),
+            )
+
+        try:
+            job = await redis.enqueue_job(
+                "sync_connection_job",
+                connection_id,
+                current_user.id,
+                lock_token,
+                _job_id=f"sync-{uuid.uuid4().hex}",
+            )
+
+            if job is None:
+                raise RuntimeError(
+                    "ARQ did not enqueue the retry job."
+                )
+
+        except Exception:
+            await redis.eval(
+                """
+                if redis.call("GET", KEYS[1]) == ARGV[1] then
+                    return redis.call("DEL", KEYS[1])
+                end
+                return 0
+                """,
+                1,
+                lock_key,
+                lock_token,
+            )
+            raise
 
         return {
+            "status": "queued",
+            "connection_id": connection_id,
+            "job_id": job.job_id,
             "retry_of_sync_run_id": sync_run_id,
-            **result,
+            "message": "Retry job queued successfully.",
         }
 
-    except ValueError as error:
-        raise HTTPException(
-            status_code=400,
-            detail=str(error),
-        )
+    except HTTPException:
+        raise
 
     except Exception:
         raise HTTPException(
-            status_code=500,
-            detail="Retry failed. Check the new sync run history for details.",
+            status_code=503,
+            detail=(
+                "Unable to queue retry. "
+                "Check that Redis is running."
+            ),
         )
 
     finally:
-        if source_engine_for_connection is not None:
-            source_engine_for_connection.dispose()
+        if redis is not None:
+            await redis.aclose()
 
-        if destination_engine_for_connection is not None:
-            destination_engine_for_connection.dispose()
 
 
 
@@ -1646,6 +1746,99 @@ def get_sync_runs(
             ],
 
         }
+
+
+
+@app.get("/connections/{connection_id}/sync-jobs/{job_id}")
+async def get_sync_job_status(
+    connection_id: int,
+    job_id: str,
+    current_user: User = Depends(get_current_user),
+):
+    # Ensure the connection belongs to the logged-in user.
+    with Session(datasync_engine) as session:
+        get_owned_connection(
+            session,
+            connection_id,
+            current_user.id,
+        )
+
+    redis = None
+
+    try:
+        redis = await create_pool(
+            RedisSettings.from_dsn(
+                os.getenv(
+                    "REDIS_URL",
+                    "redis://localhost:6379/0",
+                )
+            )
+        )
+
+        job = Job(job_id, redis)
+
+        # Retrieve the job definition to verify its ownership.
+        job_info = await job.info()
+
+        if job_info is None:
+            return {
+                "job_id": job_id,
+                "connection_id": connection_id,
+                "status": "not_found",
+                "message": (
+                    "The job was not found in ARQ's "
+                    "available job records."
+                ),
+            }
+
+        # ARQ stores the positional arguments used to enqueue
+        # the job. Verify the connection and user IDs.
+        job_args = job_info.args
+
+        if (
+            len(job_args) < 2
+            or job_args[0] != connection_id
+            or job_args[1] != current_user.id
+        ):
+            raise HTTPException(
+                status_code=404,
+                detail="Job not found for this connection.",
+            )
+
+        job_status = await job.status()
+
+        status_map = {
+            JobStatus.queued: "queued",
+            JobStatus.in_progress: "running",
+            JobStatus.complete: "complete",
+            JobStatus.not_found: "not_found",
+        }
+
+        return {
+            "job_id": job_id,
+            "connection_id": connection_id,
+            "status": status_map.get(
+                job_status,
+                str(job_status),
+            ),
+        }
+
+    except HTTPException:
+        raise
+
+    except Exception:
+        raise HTTPException(
+            status_code=503,
+            detail="Unable to retrieve job status from Redis.",
+        )
+
+    finally:
+        if redis is not None:
+            await redis.aclose()
+
+
+
+
 
 
 @app.post("/auth/token")

@@ -1,3 +1,4 @@
+
 from datetime import datetime, timezone
 
 from sqlalchemy.orm import Session
@@ -17,6 +18,7 @@ def run_sync(
     source_engine,
     destination_engine,
     connection_id,
+    arq_job_id=None,
 ):
     """
     Executes a sync and manages the SyncRun lifecycle.
@@ -24,9 +26,13 @@ def run_sync(
     This is shared by:
     - normal syncs
     - retries
+
+    arq_job_id links this database sync run to its ARQ background job.
+    If ARQ retries the job, each execution creates a new SyncRun with
+    the same ARQ job ID.
     """
 
-    # Get connection metadata
+    # Get connection metadata.
     with Session(datasync_engine) as session:
         connection = (
             session.query(Connection)
@@ -42,10 +48,11 @@ def run_sync(
         source_table = connection.source_table
         destination_table = connection.destination_table
 
-    # Create a new sync run
+    # Create a new sync run and associate it with the ARQ job.
     with Session(datasync_engine) as session:
         sync_run = SyncRun(
             connection_id=connection_id,
+            arq_job_id=arq_job_id,
             status=SYNC_RUNNING,
             started_at=datetime.now(timezone.utc),
         )
@@ -57,7 +64,7 @@ def run_sync(
         sync_run_id = sync_run.id
 
     try:
-        # Get approved mappings
+        # Get approved field mappings.
         from app.models import FieldMapping
 
         with Session(datasync_engine) as session:
@@ -82,7 +89,7 @@ def run_sync(
                 "No approved field mappings exist for this connection"
             )
 
-        # Execute sync
+        # Execute the synchronization.
         result = sync_table(
             source_engine=source_engine,
             destination_engine=destination_engine,
@@ -94,19 +101,24 @@ def run_sync(
             connection_id=connection_id,
         )
 
-        # Determine final status
+        # Determine the final status.
         if result["failed_count"] > 0:
             final_status = SYNC_COMPLETED_WITH_ERRORS
         else:
             final_status = SYNC_SUCCESS
 
-        # Update SyncRun
+        # Update the SyncRun with its final results.
         with Session(datasync_engine) as session:
             sync_run = (
                 session.query(SyncRun)
                 .filter(SyncRun.id == sync_run_id)
                 .first()
             )
+
+            if sync_run is None:
+                raise ValueError(
+                    f"SyncRun {sync_run_id} does not exist"
+                )
 
             sync_run.status = final_status
             sync_run.finished_at = datetime.now(timezone.utc)
@@ -126,7 +138,7 @@ def run_sync(
         }
 
     except Exception as error:
-        # Mark the run as completely failed
+        # Mark this execution's SyncRun as failed.
         with Session(datasync_engine) as session:
             sync_run = (
                 session.query(SyncRun)

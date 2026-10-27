@@ -164,6 +164,14 @@ class SyncRun(Base):
         ForeignKey("connections.id")
     )
 
+    
+    arq_job_id: Mapped[str | None] = mapped_column(
+        String(100),
+        nullable=True,
+        index=True,
+    )
+
+
     status: Mapped[str] = mapped_column(
         String(50),
         default="running",

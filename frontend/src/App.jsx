@@ -36,6 +36,7 @@ import {
   approveMapping,
   runSync,
   getSyncHistory,
+  getSyncJobStatus,
 } from "./api/connections";
 
 import "./App.css";
@@ -790,10 +791,95 @@ useEffect(() => {
    SYNC VIEWER
 ========================================================= */
 
+
+
 function SyncViewer({ connectionId }) {
   const [syncing, setSyncing] = useState(false);
   const [result, setResult] = useState(null);
   const [error, setError] = useState(null);
+  const [jobId, setJobId] = useState(null);
+
+  // Poll the backend while the ARQ job is queued or running.
+  useEffect(() => {
+    if (!jobId) {
+      return;
+    }
+
+    let cancelled = false;
+    let timer;
+
+    async function pollJob() {
+      try {
+        const data = await getSyncJobStatus(
+          connectionId,
+          jobId
+        );
+
+        if (cancelled) {
+          return;
+        }
+
+        const syncRun = data.sync_run;
+        const arqStatus = data.arq_status;
+
+        if (syncRun) {
+          setResult(syncRun);
+        }
+
+        const syncFinished =
+          syncRun &&
+          [
+            "success",
+            "completed_with_errors",
+            "failed",
+          ].includes(syncRun.status);
+
+        if (syncFinished || arqStatus === "complete") {
+          setSyncing(false);
+          setJobId(null);
+
+          if (!syncRun) {
+            setError(
+              "The background job finished without a sync-run result."
+            );
+          }
+
+          return;
+        }
+
+        if (arqStatus === "not_found") {
+          setSyncing(false);
+          setJobId(null);
+          setError(
+            "The synchronization job could not be found."
+          );
+          return;
+        }
+
+        timer = setTimeout(pollJob, 1500);
+      } catch (err) {
+        if (cancelled) {
+          return;
+        }
+
+        console.error(err);
+
+        setSyncing(false);
+        setJobId(null);
+        setError(
+          err.response?.data?.detail ||
+            "Unable to retrieve synchronization status."
+        );
+      }
+    }
+
+    pollJob();
+
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
+  }, [connectionId, jobId]);
 
   async function handleSync() {
     try {
@@ -803,35 +889,40 @@ function SyncViewer({ connectionId }) {
 
       const data = await runSync(connectionId);
 
+      if (data.status === "queued" && data.job_id) {
+        setJobId(data.job_id);
+        return;
+      }
+
+      // Keep compatibility with a synchronous response.
       setResult(data);
+      setSyncing(false);
     } catch (err) {
       console.error(err);
 
       setError(
         err.response?.data?.detail ||
-          "Unable to run synchronization."
+          "Unable to queue synchronization."
       );
-    } finally {
+
       setSyncing(false);
     }
   }
 
   const status = result?.status;
-
   const inserted = result?.inserted_count ?? 0;
   const updated = result?.updated_count ?? 0;
   const failed = result?.failed_count ?? 0;
 
+  const isPending =
+    syncing && (!result || status === "running");
+
   return (
     <div className="sync-section">
-
       <div className="content-card">
-
         <div className="card-header">
-
           <div>
             <h2>Run Synchronization</h2>
-
             <p>
               Synchronize approved mappings from the source
               database to the destination.
@@ -847,141 +938,109 @@ function SyncViewer({ connectionId }) {
               size={15}
               className={syncing ? "spin" : ""}
             />
-
-            {syncing
-              ? "Synchronizing..."
-              : "Run Sync"}
+            {syncing ? "Synchronizing..." : "Run Sync"}
           </button>
-
         </div>
 
-
         <div className="sync-info">
-
           <div className="sync-info-icon">
             <AlertCircle size={17} />
           </div>
 
           <div>
             <strong>Before running a sync</strong>
-
             <p>
               Make sure the required field mappings have
               been approved.
             </p>
           </div>
-
         </div>
-
       </div>
-
 
       {error && (
         <div className="error-banner">
-
           <AlertCircle size={18} />
-
           <span>{error}</span>
-
         </div>
       )}
 
+      {syncing && (
+        <div className="content-card">
+          <div className="loading-state">
+            <RefreshCw size={24} className="spin" />
+            <span>
+              {status === "running"
+                ? "Synchronization is running..."
+                : "Synchronization is queued or starting..."}
+            </span>
+          </div>
+        </div>
+      )}
 
       {result && (
         <div className="content-card sync-result-card">
-
           <div className="card-header">
-
             <div>
-
               <h2>
                 {status === "success"
                   ? "Synchronization completed"
                   : status === "completed_with_errors"
                     ? "Synchronization completed with errors"
-                    : "Synchronization failed"}
+                    : status === "failed"
+                      ? "Synchronization failed"
+                      : "Synchronization status"}
               </h2>
 
               <p>
                 Sync run #{result.id ?? "—"}
               </p>
-
             </div>
 
             <span
               className={`match-badge ${
-                status === "success"
-                  ? "high"
-                  : ""
+                status === "success" ? "high" : ""
               }`}
             >
               {status || "unknown"}
             </span>
-
           </div>
 
-
           <div className="sync-metrics">
-
             <div className="stat-card">
-
-              <span className="stat-label">
-                Inserted
-              </span>
-
+              <span className="stat-label">Inserted</span>
               <strong className="stat-value">
                 {inserted}
               </strong>
-
             </div>
 
-
             <div className="stat-card">
-
-              <span className="stat-label">
-                Updated
-              </span>
-
+              <span className="stat-label">Updated</span>
               <strong className="stat-value">
                 {updated}
               </strong>
-
             </div>
 
-
             <div className="stat-card">
-
-              <span className="stat-label">
-                Failed
-              </span>
-
+              <span className="stat-label">Failed</span>
               <strong className="stat-value">
                 {failed}
               </strong>
-
             </div>
-
           </div>
-
 
           {result.error_message && (
             <div className="error-banner">
-
               <AlertCircle size={18} />
-
-              <span>
-                {result.error_message}
-              </span>
-
+              <span>{result.error_message}</span>
             </div>
           )}
-
         </div>
       )}
-
     </div>
   );
 }
+
+
 
 
 /* =========================================================

@@ -47,10 +47,30 @@ export async function runSync(connectionId) {
   return response.data;
 }
 
+
+export async function getSyncJobStatus(connectionId, jobId) {
+  const response = await api.get(
+    `/connections/${connectionId}/sync-jobs/${encodeURIComponent(jobId)}`
+  );
+
+  return response.data;
+}
+
+
 export async function testConnection(data) {
   const response = await api.post(
     "/connections/test",
     data
+  );
+
+  return response.data;
+}
+
+
+
+export async function getSyncJobStatus(connectionId, jobId) {
+  const response = await api.get(
+    `/connections/${connectionId}/sync-jobs/${jobId}`
   );
 
   return response.data;
