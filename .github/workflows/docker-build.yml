@@ -35,7 +35,7 @@ jobs:
 
       - name: Run automated tests
         env:
-          DATASYNC_ENCRYPTION_KEY: "MDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDA="
+          DATASYNC_ENCRYPTION_KEY: "hjPy_w2zvAOd8cxWuhN_itXKU-rv6XZ1iqG6bNHru7k="
         run: python -m pytest -v
 
   build:
