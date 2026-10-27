@@ -1,7 +1,7 @@
 
 import os
 from unittest.mock import MagicMock
-
+import pytest_asyncio
 import pytest
 from arq import Retry
 from redis.asyncio import Redis
@@ -9,7 +9,7 @@ from redis.asyncio import Redis
 from app import worker
 
 
-@pytest.fixture
+@pytest_asyncio.fixture
 async def redis_client():
     client = Redis.from_url(
         os.getenv("REDIS_URL", "redis://localhost:6379/0"),
